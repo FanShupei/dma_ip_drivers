@@ -53,13 +53,16 @@ static ssize_t char_events_read(struct file *file, char __user *buf,
 	 * or a signal arrived
 	 */
 	rv = wait_event_interruptible(user_irq->events_wq,
-			user_irq->events_irq != 0);
+			user_irq->events_irq != 0 || READ_ONCE(xcdev->xpdev->removing));
 	if (rv)
 		dbg_sg("wait_event_interruptible=%d\n", rv);
 
 	/* wait_event_interruptible() was interrupted by a signal */
 	if (rv == -ERESTARTSYS)
 		return -ERESTARTSYS;
+
+	if (READ_ONCE(xcdev->xpdev->removing))
+		return -ENODEV;
 
 	/* atomically decide which events are passed to the user */
 	spin_lock_irqsave(&user_irq->events_lock, flags);

@@ -23,7 +23,6 @@
 
 static struct class *g_xdma_class;
 
-struct kmem_cache *cdev_cache;
 
 enum cdev_type {
 	CHAR_USER,
@@ -259,22 +258,233 @@ static int destroy_xcdev(struct xdma_cdev *cdev)
 		return -EINVAL;
 	}
 
-	if (!g_xdma_class) {
-		pr_err("g_xdma_class NULL\n");
-		return -EINVAL;
-	}
-
-	if (!cdev->sys_device) {
-		pr_err("cdev sys_device NULL\n");
-		return -EINVAL;
-	}
-
-	if (cdev->sys_device)
+	if (!cdev->added)
+		return 0;
+	if (!IS_ERR_OR_NULL(cdev->sys_device))
 		device_destroy(g_xdma_class, cdev->cdevno);
-
+	cdev->sys_device = NULL;
 	cdev_del(&cdev->cdev);
+	cdev->added = false;
 
 	return 0;
+}
+
+/* Every file operation excludes hardware teardown. Open files also pin the
+ * containing allocation, including event waitqueues used by poll/epoll.
+ */
+static int guarded_open(struct inode *inode, struct file *file)
+{
+	struct xdma_cdev *xcdev = container_of(inode->i_cdev, struct xdma_cdev, cdev);
+	struct xdma_pci_dev *xpdev = xcdev->xpdev;
+	int rv = -ENODEV;
+
+	get_device(&xpdev->lifetime);
+	down_read(&xpdev->io_lock);
+	if (!READ_ONCE(xpdev->removing)) {
+		mutex_lock(&xcdev->open_lock);
+		rv = xcdev->ops->open(inode, file);
+		if (!rv && !xcdev->inode)
+			xcdev->inode = igrab(inode);
+		mutex_unlock(&xcdev->open_lock);
+	}
+	up_read(&xpdev->io_lock);
+	if (rv)
+		put_device(&xpdev->lifetime);
+	return rv;
+}
+
+static int guarded_release(struct inode *inode, struct file *file)
+{
+	struct xdma_cdev *xcdev = file->private_data;
+	struct xdma_pci_dev *xpdev = xcdev->xpdev;
+	int rv = 0;
+
+	down_read(&xpdev->io_lock);
+	if (!READ_ONCE(xpdev->removing) && xcdev->ops->release) {
+		mutex_lock(&xcdev->open_lock);
+		rv = xcdev->ops->release(inode, file);
+		mutex_unlock(&xcdev->open_lock);
+	}
+	up_read(&xpdev->io_lock);
+	put_device(&xpdev->lifetime);
+	return rv;
+}
+
+static ssize_t guarded_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
+{
+	struct xdma_cdev *xcdev = file->private_data;
+	struct xdma_pci_dev *xpdev = xcdev->xpdev;
+	ssize_t rv = -ENODEV;
+
+	down_read(&xpdev->io_lock);
+	if (!READ_ONCE(xpdev->removing))
+		rv = xcdev->ops->read(file, buf, count, pos);
+	up_read(&xpdev->io_lock);
+	return rv;
+}
+
+static ssize_t guarded_write(struct file *file, const char __user *buf, size_t count, loff_t *pos)
+{
+	struct xdma_cdev *xcdev = file->private_data;
+	struct xdma_pci_dev *xpdev = xcdev->xpdev;
+	ssize_t rv = -ENODEV;
+
+	down_read(&xpdev->io_lock);
+	if (!READ_ONCE(xpdev->removing))
+		rv = xcdev->ops->write(file, buf, count, pos);
+	up_read(&xpdev->io_lock);
+	return rv;
+}
+
+static long guarded_unlocked_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	struct xdma_cdev *xcdev = file->private_data;
+	struct xdma_pci_dev *xpdev = xcdev->xpdev;
+	long rv = -ENODEV;
+
+	down_read(&xpdev->io_lock);
+	if (!READ_ONCE(xpdev->removing))
+		rv = xcdev->ops->unlocked_ioctl(file, cmd, arg);
+	up_read(&xpdev->io_lock);
+	return rv;
+}
+
+static int guarded_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct xdma_cdev *xcdev = file->private_data;
+	struct xdma_pci_dev *xpdev = xcdev->xpdev;
+	int rv = -ENODEV;
+
+	down_read(&xpdev->io_lock);
+	if (!READ_ONCE(xpdev->removing))
+		rv = xcdev->ops->mmap(file, vma);
+	up_read(&xpdev->io_lock);
+	return rv;
+}
+
+static loff_t guarded_llseek(struct file *file, loff_t off, int whence)
+{
+	struct xdma_cdev *xcdev = file->private_data;
+	struct xdma_pci_dev *xpdev = xcdev->xpdev;
+	loff_t rv = -ENODEV;
+
+	down_read(&xpdev->io_lock);
+	if (!READ_ONCE(xpdev->removing))
+		rv = xcdev->ops->llseek(file, off, whence);
+	up_read(&xpdev->io_lock);
+	return rv;
+}
+
+static unsigned int guarded_poll(struct file *file, poll_table *wait)
+{
+	struct xdma_cdev *xcdev = file->private_data;
+	struct xdma_pci_dev *xpdev = xcdev->xpdev;
+	unsigned int rv = POLLERR | POLLHUP;
+
+	down_read(&xpdev->io_lock);
+	if (!READ_ONCE(xpdev->removing))
+		rv = xcdev->ops->poll(file, wait);
+	up_read(&xpdev->io_lock);
+	return rv;
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0)
+static ssize_t guarded_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+{
+	struct xdma_cdev *xcdev = iocb->ki_filp->private_data;
+	struct xdma_pci_dev *xpdev = xcdev->xpdev;
+	ssize_t rv = -ENODEV;
+
+	down_read(&xpdev->io_lock);
+	if (!READ_ONCE(xpdev->removing))
+		rv = xcdev->ops->read_iter(iocb, iter);
+	up_read(&xpdev->io_lock);
+	return rv;
+}
+
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0)
+static ssize_t guarded_write_iter(struct kiocb *iocb, struct iov_iter *iter)
+{
+	struct xdma_cdev *xcdev = iocb->ki_filp->private_data;
+	struct xdma_pci_dev *xpdev = xcdev->xpdev;
+	ssize_t rv = -ENODEV;
+
+	down_read(&xpdev->io_lock);
+	if (!READ_ONCE(xpdev->removing))
+		rv = xcdev->ops->write_iter(iocb, iter);
+	up_read(&xpdev->io_lock);
+	return rv;
+}
+
+#endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 16, 0)
+static ssize_t guarded_aio_read(struct kiocb *iocb, const struct iovec *iov, unsigned long nr, loff_t pos)
+{
+	struct xdma_cdev *xcdev = iocb->ki_filp->private_data;
+	struct xdma_pci_dev *xpdev = xcdev->xpdev;
+	ssize_t rv = -ENODEV;
+
+	down_read(&xpdev->io_lock);
+	if (!READ_ONCE(xpdev->removing))
+		rv = xcdev->ops->aio_read(iocb, iov, nr, pos);
+	up_read(&xpdev->io_lock);
+	return rv;
+}
+
+#endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 16, 0)
+static ssize_t guarded_aio_write(struct kiocb *iocb, const struct iovec *iov, unsigned long nr, loff_t pos)
+{
+	struct xdma_cdev *xcdev = iocb->ki_filp->private_data;
+	struct xdma_pci_dev *xpdev = xcdev->xpdev;
+	ssize_t rv = -ENODEV;
+
+	down_read(&xpdev->io_lock);
+	if (!READ_ONCE(xpdev->removing))
+		rv = xcdev->ops->aio_write(iocb, iov, nr, pos);
+	up_read(&xpdev->io_lock);
+	return rv;
+}
+
+#endif
+static void guard_file_operations(struct xdma_cdev *xcdev)
+{
+	xcdev->ops = xcdev->cdev.ops;
+	xcdev->guarded_ops = *xcdev->ops;
+	xcdev->guarded_ops.open = guarded_open;
+	xcdev->guarded_ops.release = guarded_release;
+	if (xcdev->ops->read)
+		xcdev->guarded_ops.read = guarded_read;
+	if (xcdev->ops->write)
+		xcdev->guarded_ops.write = guarded_write;
+	if (xcdev->ops->unlocked_ioctl)
+		xcdev->guarded_ops.unlocked_ioctl = guarded_unlocked_ioctl;
+	if (xcdev->ops->mmap)
+		xcdev->guarded_ops.mmap = guarded_mmap;
+	if (xcdev->ops->llseek)
+		xcdev->guarded_ops.llseek = guarded_llseek;
+	if (xcdev->ops->poll)
+		xcdev->guarded_ops.poll = guarded_poll;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0)
+	if (xcdev->ops->read_iter)
+		xcdev->guarded_ops.read_iter = guarded_read_iter;
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0)
+	if (xcdev->ops->write_iter)
+		xcdev->guarded_ops.write_iter = guarded_write_iter;
+#endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 16, 0)
+	if (xcdev->ops->aio_read)
+		xcdev->guarded_ops.aio_read = guarded_aio_read;
+#endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 16, 0)
+	if (xcdev->ops->aio_write)
+		xcdev->guarded_ops.aio_write = guarded_aio_write;
+#endif
+	xcdev->cdev.ops = &xcdev->guarded_ops;
+	cdev_set_parent(&xcdev->cdev, &xcdev->xpdev->lifetime.kobj);
+	xcdev->cdev.owner = THIS_MODULE;
 }
 
 static int create_xcdev(struct xdma_pci_dev *xpdev, struct xdma_cdev *xcdev,
@@ -287,6 +497,8 @@ static int create_xcdev(struct xdma_pci_dev *xpdev, struct xdma_cdev *xcdev,
 	dev_t dev;
 
 	spin_lock_init(&xcdev->lock);
+	mutex_init(&xcdev->open_lock);
+	mutex_init(&xcdev->xvc_lock);
 	/* new instance? */
 	if (!xpdev->major) {
 		/* allocate a dynamically allocated char device node */
@@ -356,12 +568,19 @@ static int create_xcdev(struct xdma_pci_dev *xpdev, struct xdma_cdev *xcdev,
 	}
 	xcdev->cdevno = MKDEV(xpdev->major, minor);
 
+	guard_file_operations(xcdev);
+	list_add_tail(&xcdev->entry, &xpdev->cdev_list);
+
 	/* bring character device live */
 	rv = cdev_add(&xcdev->cdev, xcdev->cdevno, 1);
 	if (rv < 0) {
 		pr_err("cdev_add failed %d, type 0x%x.\n", rv, type);
+		/* cdev_add only acquires the parent reference on success. */
+		xcdev->cdev.kobj.parent = NULL;
+		kobject_put(&xcdev->cdev.kobj);
 		goto unregister_region;
 	}
+	xcdev->added = true;
 
 	dbg_init("xcdev 0x%p, %u:%u, %s, type 0x%x.\n",
 		xcdev, xpdev->major, minor, xcdev->cdev.kobj.name, type);
@@ -377,8 +596,8 @@ static int create_xcdev(struct xdma_pci_dev *xpdev, struct xdma_cdev *xcdev,
 
 del_cdev:
 	cdev_del(&xcdev->cdev);
+	xcdev->added = false;
 unregister_region:
-	unregister_chrdev_region(xcdev->cdevno, XDMA_MINOR_COUNT);
 	return rv;
 }
 
@@ -463,6 +682,8 @@ void xpdev_destroy_interfaces(struct xdma_pci_dev *xpdev)
 		unregister_chrdev_region(
 				MKDEV(xpdev->major, XDMA_MINOR_BASE),
 				XDMA_MINOR_COUNT);
+	xpdev->major = 0;
+	xpdev->flags = 0;
 }
 
 int xpdev_create_interfaces(struct xdma_pci_dev *xpdev)
@@ -619,24 +840,11 @@ int xdma_cdev_init(void)
 		return -EINVAL;
 	}
 
-	/* using kmem_cache_create to enable sequential cleanup */
-	cdev_cache = kmem_cache_create("cdev_cache",
-					sizeof(struct cdev_async_io), 0,
-					SLAB_HWCACHE_ALIGN, NULL);
-
-	if (!cdev_cache) {
-		pr_info("memory allocation for cdev_cache failed. OOM\n");
-		return -ENOMEM;
-	}
-
 	return 0;
 }
 
 void xdma_cdev_cleanup(void)
 {
-	if (cdev_cache)
-		kmem_cache_destroy(cdev_cache);
-
 	if (g_xdma_class)
 		class_destroy(g_xdma_class);
 }

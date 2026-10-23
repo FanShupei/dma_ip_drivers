@@ -26,6 +26,7 @@
  */
 #include <linux/version.h>
 #include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include <linux/kthread.h>
 #include <linux/cpuset.h>
 #include <linux/signal.h>
@@ -78,6 +79,8 @@
 struct xdma_kthread {
 	/**  thread lock*/
 	spinlock_t lock;
+	/* Pin work-list entries while callbacks run without the spinlock. */
+	struct mutex work_lock;
 	/**  name of the thread */
 	char name[16];
 	/**  cpu number for which the thread associated with */

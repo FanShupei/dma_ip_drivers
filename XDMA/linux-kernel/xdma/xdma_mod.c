@@ -117,18 +117,44 @@ static const struct pci_device_id pci_ids[] = {
 };
 MODULE_DEVICE_TABLE(pci, pci_ids);
 
+static void xpdev_release(struct device *dev)
+{
+	struct xdma_pci_dev *xpdev = container_of(dev, struct xdma_pci_dev, lifetime);
+
+	kfree(xpdev->xdev);
+	pci_dev_put(xpdev->pdev);
+	kfree(xpdev);
+}
+
 static void xpdev_free(struct xdma_pci_dev *xpdev)
 {
 	struct xdma_dev *xdev = xpdev->xdev;
+	struct xdma_cdev *xcdev;
+	int i;
 
-	pr_info("xpdev 0x%p, destroy_interfaces, xdev 0x%p.\n", xpdev, xdev);
+	/* Wake blocking event readers before waiting for their read locks. */
+	WRITE_ONCE(xpdev->removing, true);
+	if (xdev)
+		for (i = 0; i < xdev->user_max; i++)
+			wake_up_all(&xdev->user_irq[i].events_wq);
 	xpdev_destroy_interfaces(xpdev);
-	xpdev->xdev = NULL;
-	pr_info("xpdev 0x%p, xdev 0x%p xdma_device_close.\n", xpdev, xdev);
-	xdma_device_close(xpdev->pdev, xdev);
-	xpdev_cnt--;
 
-	kfree(xpdev);
+	/* Wait for submissions that could still enqueue a worker. */
+	down_write(&xpdev->io_lock);
+	up_write(&xpdev->io_lock);
+	destroy_workqueue(xpdev->io_wq);
+	down_write(&xpdev->io_lock);
+	list_for_each_entry(xcdev, &xpdev->cdev_list, entry)
+		if (xcdev->inode) {
+			unmap_mapping_range(xcdev->inode->i_mapping, 0, 0, 1);
+			iput(xcdev->inode);
+			xcdev->inode = NULL;
+		}
+	if (xdev)
+		xdma_device_detach(xpdev->pdev, xdev);
+	up_write(&xpdev->io_lock);
+	xpdev_cnt--;
+	put_device(&xpdev->lifetime);
 }
 
 static struct xdma_pci_dev *xpdev_alloc(struct pci_dev *pdev)
@@ -140,7 +166,16 @@ static struct xdma_pci_dev *xpdev_alloc(struct pci_dev *pdev)
 	memset(xpdev, 0, sizeof(*xpdev));
 
 	xpdev->magic = MAGIC_DEVICE;
-	xpdev->pdev = pdev;
+	xpdev->pdev = pci_dev_get(pdev);
+	INIT_LIST_HEAD(&xpdev->cdev_list);
+	init_rwsem(&xpdev->io_lock);
+	device_initialize(&xpdev->lifetime);
+	xpdev->lifetime.release = xpdev_release;
+	xpdev->io_wq = alloc_workqueue("xdma_io", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+	if (!xpdev->io_wq) {
+		put_device(&xpdev->lifetime);
+		return NULL;
+	}
 	xpdev->user_max = MAX_USER_IRQ;
 	xpdev->h2c_channel_max = XDMA_CHANNEL_NUM_MAX;
 	xpdev->c2h_channel_max = XDMA_CHANNEL_NUM_MAX;
@@ -166,6 +201,8 @@ static int probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 		rv = -EINVAL;
 		goto err_out;
 	}
+
+	xpdev->xdev = hndl;
 
 	if (xpdev->user_max > MAX_USER_IRQ) {
 		pr_err("Maximum users limit reached\n");

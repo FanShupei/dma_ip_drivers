@@ -23,6 +23,7 @@
 #include <linux/types.h>
 #include <linux/module.h>
 #include <linux/cdev.h>
+#include <linux/rwsem.h>
 #include <linux/dma-mapping.h>
 #include <linux/delay.h>
 #include <linux/fb.h>
@@ -63,6 +64,13 @@ struct xdma_cdev {
 	struct xdma_pci_dev *xpdev;
 	struct xdma_dev *xdev;
 	dev_t cdevno;			/* character device major:minor */
+	struct list_head entry;
+	struct inode *inode;
+	bool added;
+	struct mutex open_lock;
+	struct mutex xvc_lock;
+	struct file_operations guarded_ops;
+	const struct file_operations *ops;
 	struct cdev cdev;		/* character device embedded struct */
 	int bar;			/* PCIe BAR for HW access, if needed */
 	unsigned long base;		/* bar access offset */
@@ -74,6 +82,11 @@ struct xdma_cdev {
 
 /* XDMA PCIe device specific book-keeping */
 struct xdma_pci_dev {
+	struct device lifetime;
+	struct list_head cdev_list;
+	struct rw_semaphore io_lock;
+	bool removing;
+	struct workqueue_struct *io_wq;
 	unsigned long magic;		/* structure ID for sanity checks */
 	struct pci_dev *pdev;	/* pci device struct from probe() */
 	struct xdma_dev *xdev;
@@ -98,21 +111,6 @@ struct xdma_pci_dev {
 	struct xdma_cdev xvc_cdev;
 
 	void *data;
-};
-
-struct cdev_async_io {
-	struct kiocb *iocb;
-	struct xdma_io_cb *cb;
-	bool write;
-	bool cancel;
-	int cmpl_cnt;
-	int req_cnt;
-	spinlock_t lock;
-	struct work_struct wrk_itm;
-	struct cdev_async_io *next;
-	ssize_t res;
-	ssize_t res2;
-	int err_cnt;
 };
 
 #endif /* ifndef __XDMA_MODULE_H__ */

@@ -477,8 +477,8 @@ struct xdma_request_cb {
 	unsigned int sg_idx;
 	unsigned int sg_offset;
 
-	/* Use two transfers in case single request needs to be split */
-	struct xdma_transfer tfer[2];
+	/* Blocking submissions reuse this after each completed chunk. */
+	struct xdma_transfer tfer[1];
 
 	struct xdma_io_cb *cb;
 
@@ -597,6 +597,7 @@ struct xdma_dev {
 	unsigned int flags;
 
 	/* PCIe BAR management */
+	resource_size_t bar_len[XDMA_BAR_NUM];
 	void __iomem *bar[XDMA_BAR_NUM];	/* addresses for mapped BARs */
 	int user_bar_idx;	/* BAR index of user logic */
 	int config_bar_idx;	/* BAR index of XDMA config logic */

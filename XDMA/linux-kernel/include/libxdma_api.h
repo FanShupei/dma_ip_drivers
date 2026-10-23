@@ -73,6 +73,8 @@ void *xdma_device_open(const char *mod_name, struct pci_dev *pdev,
  * @tuples: from xdma_device_open()
  */
 void xdma_device_close(struct pci_dev *pdev, void *dev_handle);
+/* Release hardware now; the caller retains and eventually frees dev_handle. */
+void xdma_device_detach(struct pci_dev *pdev, void *dev_handle);
 
 /* 
  * xdma_device_restart - restart the fpga
@@ -132,15 +134,6 @@ int xdma_user_isr_disable(void *dev_hndl, unsigned int mask);
  */
 ssize_t xdma_xfer_submit(void *dev_hndl, int channel, bool write, u64 ep_addr,
 			struct sg_table *sgt, bool dma_mapped, int timeout_ms);
-
-ssize_t xdma_xfer_submit_nowait(void *cb_hndl, void *dev_hndl, int channel, bool write, u64 ep_addr,
-			struct sg_table *sgt, bool dma_mapped, int timeout_ms);
-
-
-ssize_t xdma_xfer_completion(void *cb_hndl, void *dev_hndl, int channel, bool write, u64 ep_addr,
-			struct sg_table *sgt, bool dma_mapped, int timeout_ms);
-
-			
 
 /////////////////////missing API////////////////////
 

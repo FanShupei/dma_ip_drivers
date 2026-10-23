@@ -45,114 +45,6 @@ unsigned int c2h_timeout = 10;
 module_param(c2h_timeout, uint, 0644);
 MODULE_PARM_DESC(c2h_timeout, "C2H sgdma timeout in seconds, default is 10 sec.");
 
-extern struct kmem_cache *cdev_cache;
-static void char_sgdma_unmap_user_buf(struct xdma_io_cb *cb, bool write);
-
-
-static void async_io_handler(unsigned long  cb_hndl, int err)
-{
-	struct xdma_cdev *xcdev;
-	struct xdma_engine *engine;
-	struct xdma_dev *xdev;
-	struct xdma_io_cb *cb = (struct xdma_io_cb *)cb_hndl;
-	struct cdev_async_io *caio = (struct cdev_async_io *)cb->private;
-	ssize_t numbytes = 0;
-	ssize_t res, res2;
-	int lock_stat;
-	int rv;
-
-	if (caio == NULL) {
-		pr_err("Invalid work struct\n");
-		return;
-	}
-
-	xcdev = (struct xdma_cdev *)caio->iocb->ki_filp->private_data;
-	rv = xcdev_check(__func__, xcdev, 1);
-	if (rv < 0)
-		return;
-
-	/* Safeguarding for cancel requests */
-	lock_stat = spin_trylock(&caio->lock);
-	if (!lock_stat) {
-		pr_err("caio lock not acquired\n");
-		goto skip_dev_lock;
-	}
-
-	if (false != caio->cancel) {
-		pr_err("skipping aio\n");
-		goto skip_tran;
-	}
-
-	engine = xcdev->engine;
-	xdev = xcdev->xdev;
-
-	if (!err)
-		numbytes = xdma_xfer_completion((void *)cb, xdev,
-				engine->channel, cb->write, cb->ep_addr,
-				&cb->sgt, 0, 
-				cb->write ? h2c_timeout * 1000 :
-					    c2h_timeout * 1000);
-
-	char_sgdma_unmap_user_buf(cb, cb->write);
-
-	caio->res2 |= (err < 0) ? err : 0;
-	if (caio->res2)
-		caio->err_cnt++;
-
-	caio->cmpl_cnt++;
-	caio->res += numbytes;
-
-	if (caio->cmpl_cnt == caio->req_cnt) {
-		res = caio->res;
-		res2 = caio->res2;
-#if defined(RHEL_RELEASE_CODE)
-    #if (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 0))
-                caio->iocb->ki_complete(caio->iocb, caio->err_cnt ? res2 : res);
-    #elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
-                caio->iocb->ki_complete(caio->iocb, caio->err_cnt ? res2 : res);
-    #elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
-                caio->iocb->ki_complete(caio->iocb, res, res2);
-    #else
-                aio_complete(caio->iocb, res, res2);
-    #endif
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
-		caio->iocb->ki_complete(caio->iocb, caio->err_cnt ? res2 : res);
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
-		caio->iocb->ki_complete(caio->iocb, res, res2);
-#else
-		aio_complete(caio->iocb, res, res2);
-#endif
-skip_tran:
-		spin_unlock(&caio->lock);
-		kmem_cache_free(cdev_cache, caio);
-		kfree(cb);
-		return;
-	} 
-	spin_unlock(&caio->lock);
-	return;
-
-skip_dev_lock:
-#if defined(RHEL_RELEASE_CODE)
-    #if (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 0))
-        caio->iocb->ki_complete(caio->iocb, caio->err_cnt ? res2 : res);
-    #elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
-        caio->iocb->ki_complete(caio->iocb, -EBUSY);
-    #elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
-        caio->iocb->ki_complete(caio->iocb, numbytes, -EBUSY);
-    #else
-        aio_complete(caio->iocb, numbytes, -EBUSY);
-    #endif
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
-	caio->iocb->ki_complete(caio->iocb, -EBUSY);
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
-	caio->iocb->ki_complete(caio->iocb, numbytes, -EBUSY);
-#else
-	aio_complete(caio->iocb, numbytes, -EBUSY);
-#endif
-	kmem_cache_free(cdev_cache, caio);
-}
-
-
 /*
  * character device file operations for SG DMA engine
  */
@@ -274,7 +166,7 @@ static void char_sgdma_unmap_user_buf(struct xdma_io_cb *cb, bool write)
 
 	sg_free_table(&cb->sgt);
 
-	if (!cb->pages || !cb->pages_nr)
+	if (!cb->pages)
 		return;
 
 	for (i = 0; i < cb->pages_nr; i++) {
@@ -291,6 +183,7 @@ static void char_sgdma_unmap_user_buf(struct xdma_io_cb *cb, bool write)
 
 	kfree(cb->pages);
 	cb->pages = NULL;
+	cb->pages_nr = 0;
 }
 
 static int char_sgdma_map_user_buf_to_sgl(struct xdma_io_cb *cb, bool write)
@@ -320,7 +213,7 @@ static int char_sgdma_map_user_buf_to_sgl(struct xdma_io_cb *cb, bool write)
 		goto err_out;
 	}
 
-	rv = get_user_pages_fast((unsigned long)buf, pages_nr, 1/* write */,
+	rv = get_user_pages_fast((unsigned long)buf, pages_nr, !write,
 				cb->pages);
 	/* No pages were pinned */
 	if (rv < 0) {
@@ -400,6 +293,9 @@ static ssize_t char_sgdma_read_write(struct file *file, const char __user *buf,
 		return -EINVAL;
 	}
 
+	if (!count)
+		return 0;
+
 	rv = check_transfer_align(engine, buf, count, *pos, 1);
 	if (rv) {
 		pr_info("Invalid transfer alignment detected\n");
@@ -437,184 +333,249 @@ static ssize_t char_sgdma_read(struct file *file, char __user *buf,
 	return char_sgdma_read_write(file, buf, count, pos, 0);
 }
 
-static ssize_t cdev_aio_write(struct kiocb *iocb, const struct iovec *io,
-				unsigned long count, loff_t pos)
+/* Pin every vector before queuing work: a worker has no submitting task's mm. */
+struct sgdma_request {
+	struct work_struct work;
+	struct kiocb *iocb;
+	struct xdma_cdev *xcdev;
+	struct xdma_io_cb *cb;
+	unsigned long nr;
+	bool write;
+};
+
+static void sgdma_request_free(struct sgdma_request *req)
 {
-	struct xdma_cdev *xcdev = (struct xdma_cdev *)
-					iocb->ki_filp->private_data;
-	struct cdev_async_io *caio;
-	struct xdma_engine *engine;
-	struct xdma_dev *xdev;
-	int rv;
 	unsigned long i;
 
-	if (!xcdev) {
-		pr_info("file 0x%p, xcdev NULL, %llu, pos %llu, W %d.\n",
-			iocb->ki_filp, (u64)count, (u64)pos, 1);
-		return -EINVAL;
-	}
-
-	engine = xcdev->engine;
-	xdev = xcdev->xdev;
-
-	if (engine->dir != DMA_TO_DEVICE) {
-		pr_err("r/w mismatch. WRITE, dir %d.\n",
-			engine->dir);
-		return -EINVAL;
-	}
-
-	caio = kmem_cache_alloc(cdev_cache, GFP_KERNEL);
-	memset(caio, 0, sizeof(struct cdev_async_io));
-
-	caio->cb = kzalloc(count * (sizeof(struct xdma_io_cb)), GFP_KERNEL);
-
-	spin_lock_init(&caio->lock);
-	iocb->private = caio;
-	caio->iocb = iocb;
-	caio->write = true;
-	caio->cancel = false;
-	caio->req_cnt = count;
-
-	for (i = 0; i < count; i++) {
-
-		memset(&(caio->cb[i]), 0, sizeof(struct xdma_io_cb));
-
-		caio->cb[i].buf = io[i].iov_base;
-		caio->cb[i].len = io[i].iov_len;
-		caio->cb[i].ep_addr = (u64)pos;
-		caio->cb[i].write = true;
-		caio->cb[i].private = caio;
-		caio->cb[i].io_done = async_io_handler;
-		rv = check_transfer_align(engine, caio->cb[i].buf,
-					caio->cb[i].len, pos, 1);
-		if (rv) {
-			pr_info("Invalid transfer alignment detected\n");
-			kmem_cache_free(cdev_cache, caio);
-			return rv;
-		}
-
-		rv = char_sgdma_map_user_buf_to_sgl(&caio->cb[i], true);
-		if (rv < 0)
-			return rv;
-
-		rv = xdma_xfer_submit_nowait((void *)&caio->cb[i], xdev,
-					engine->channel, caio->cb[i].write,
-					caio->cb[i].ep_addr, &caio->cb[i].sgt,
-					0, h2c_timeout * 1000);
-	}
-
-	if (engine->cmplthp)
-		xdma_kthread_wakeup(engine->cmplthp);
-
-	return -EIOCBQUEUED;
+	for (i = 0; i < req->nr; i++)
+		char_sgdma_unmap_user_buf(&req->cb[i], req->write);
+	kfree(req->cb);
+	kfree(req);
 }
 
-static ssize_t cdev_aio_read(struct kiocb *iocb, const struct iovec *io,
-				unsigned long count, loff_t pos)
+static ssize_t sgdma_request_run(struct sgdma_request *req)
 {
-
-	struct xdma_cdev *xcdev = (struct xdma_cdev *)
-					iocb->ki_filp->private_data;
-	struct cdev_async_io *caio;
-	struct xdma_engine *engine;
-	struct xdma_dev *xdev;
-	int rv;
+	struct xdma_engine *engine = req->xcdev->engine;
+	ssize_t done = 0, rv = 0;
 	unsigned long i;
 
-	if (!xcdev) {
-		pr_info("file 0x%p, xcdev NULL, %llu, pos %llu, W %d.\n",
-			iocb->ki_filp, (u64)count, (u64)pos, 1);
-		return -EINVAL;
-	}
+	for (i = 0; i < req->nr; i++) {
+		struct xdma_io_cb *cb = &req->cb[i];
 
-	engine = xcdev->engine;
-	xdev = xcdev->xdev;
-
-	if (engine->dir != DMA_FROM_DEVICE) {
-		pr_err("r/w mismatch. READ, dir %d.\n",
-			engine->dir);
-		return -EINVAL;
-	}
-
-	caio = kmem_cache_alloc(cdev_cache, GFP_KERNEL);
-	memset(caio, 0, sizeof(struct cdev_async_io));
-
-	caio->cb = kzalloc(count * (sizeof(struct xdma_io_cb)), GFP_KERNEL);
-
-	spin_lock_init(&caio->lock);
-	iocb->private = caio;
-	caio->iocb = iocb;
-	caio->write = false;
-	caio->cancel = false;
-	caio->req_cnt = count;
-
-	for (i = 0; i < count; i++) {
-
-		memset(&(caio->cb[i]), 0, sizeof(struct xdma_io_cb));
-
-		caio->cb[i].buf = io[i].iov_base;
-		caio->cb[i].len = io[i].iov_len;
-		caio->cb[i].ep_addr = (u64)pos;
-		caio->cb[i].write = false;
-		caio->cb[i].private = caio;
-		caio->cb[i].io_done = async_io_handler;
-
-		rv = check_transfer_align(engine, caio->cb[i].buf,
-					caio->cb[i].len, pos, 1);
-		if (rv) {
-			pr_info("Invalid transfer alignment detected\n");
-			kmem_cache_free(cdev_cache, caio);
-			return rv;
+		if (READ_ONCE(req->xcdev->xpdev->removing)) {
+			rv = -ENODEV;
+			break;
 		}
-
-		rv = char_sgdma_map_user_buf_to_sgl(&caio->cb[i], false);
+		rv = xdma_xfer_submit(req->xcdev->xdev, engine->channel,
+				req->write, cb->ep_addr, &cb->sgt, 0,
+				(req->write ? h2c_timeout : c2h_timeout) * 1000);
 		if (rv < 0)
-			return rv;
-
-		rv = xdma_xfer_submit_nowait((void *)&caio->cb[i], xdev,
-					engine->channel, caio->cb[i].write,
-					caio->cb[i].ep_addr, &caio->cb[i].sgt,
-					0, c2h_timeout * 1000);
+			break;
+		done += rv;
+		if ((size_t)rv != cb->len)
+			break;
 	}
+	if (done && !engine->non_incr_addr)
+		req->iocb->ki_pos += done;
+	return done ? done : rv;
+}
 
-	if (engine->cmplthp)
-		xdma_kthread_wakeup(engine->cmplthp);
+static void sgdma_request_work(struct work_struct *work)
+{
+	struct sgdma_request *req = container_of(work, struct sgdma_request, work);
+	struct xdma_pci_dev *xpdev = req->xcdev->xpdev;
+	struct kiocb *iocb = req->iocb;
+	ssize_t rv;
 
+	down_read(&xpdev->io_lock);
+	rv = READ_ONCE(xpdev->removing) ? -ENODEV : sgdma_request_run(req);
+	sgdma_request_free(req);
+	up_read(&xpdev->io_lock);
+	/* Complete exactly once, after all DMA and page cleanup has finished. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 16, 0)
+	iocb->ki_complete(iocb, rv);
+#elif defined(RHEL_RELEASE_CODE) && LINUX_VERSION_CODE >= KERNEL_VERSION(5, 14, 0)
+	iocb->ki_complete(iocb, rv);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4, 1, 0)
+	iocb->ki_complete(iocb, rv, 0);
+#else
+	aio_complete(iocb, rv, 0);
+#endif
+}
+
+static struct sgdma_request *sgdma_request_alloc(struct kiocb *iocb,
+		unsigned long nr, bool write)
+{
+	struct sgdma_request *req = kzalloc(sizeof(*req), GFP_KERNEL);
+
+	if (!req)
+		return NULL;
+	req->cb = kcalloc(nr, sizeof(*req->cb), GFP_KERNEL);
+	if (!req->cb) {
+		kfree(req);
+		return NULL;
+	}
+	req->iocb = iocb;
+	req->xcdev = iocb->ki_filp->private_data;
+	req->write = write;
+	INIT_WORK(&req->work, sgdma_request_work);
+	return req;
+}
+
+static int sgdma_request_add(struct sgdma_request *req, void __user *buf,
+		size_t len, loff_t *pos)
+{
+	struct xdma_engine *engine = req->xcdev->engine;
+	struct xdma_io_cb *cb = &req->cb[req->nr];
+	int rv;
+
+	if (!len)
+		return 0;
+	if (*pos < 0 || (u64)len > (u64)(LLONG_MAX - *pos))
+		return -EINVAL;
+	rv = check_transfer_align(engine, buf, len, *pos, 1);
+	if (rv)
+		return rv;
+	cb->buf = buf;
+	cb->len = len;
+	cb->ep_addr = *pos;
+	cb->write = req->write;
+	rv = char_sgdma_map_user_buf_to_sgl(cb, req->write);
+	if (rv)
+		return rv;
+	req->nr++;
+	if (!engine->non_incr_addr)
+		*pos += len;
+	return 0;
+}
+
+static ssize_t sgdma_request_submit(struct sgdma_request *req)
+{
+	ssize_t rv;
+
+	if (!req->nr) {
+		sgdma_request_free(req);
+		return 0;
+	}
+	if (is_sync_kiocb(req->iocb)) {
+		rv = sgdma_request_run(req);
+		sgdma_request_free(req);
+		return rv;
+	}
+	queue_work(req->xcdev->xpdev->io_wq, &req->work);
+	/* The worker may already have freed req. */
 	return -EIOCBQUEUED;
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0)
+static ssize_t cdev_sgdma_iter(struct kiocb *iocb, struct iov_iter *io, bool write)
+{
+	struct xdma_cdev *xcdev = iocb->ki_filp->private_data;
+	struct sgdma_request *req;
+	struct iov_iter iter = *io;
+	loff_t pos = iocb->ki_pos;
+	size_t count = iov_iter_count(io);
+	unsigned long nr = io->nr_segs;
+	ssize_t rv;
+
+#ifdef IOCB_NOWAIT
+	if (iocb->ki_flags & IOCB_NOWAIT)
+		return -EOPNOTSUPP;
+#endif
+	rv = xcdev_check(__func__, xcdev, 1);
+	if (rv)
+		return rv;
+	if (write != (xcdev->engine->dir == DMA_TO_DEVICE))
+		return -EINVAL;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+	if (!user_backed_iter(io))
+		return -EOPNOTSUPP;
+	if (iter_is_ubuf(io))
+		nr = 1;
+#endif
+	if (!count)
+		return 0;
+	req = sgdma_request_alloc(iocb, nr, write);
+	if (!req)
+		return -ENOMEM;
+	while (iov_iter_count(&iter)) {
+		struct iovec vec;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+		if (iter_is_ubuf(&iter)) {
+			vec.iov_base = iter.ubuf + iter.iov_offset;
+			vec.iov_len = iov_iter_count(&iter);
+		} else {
+			vec.iov_base = iter_iov(&iter)->iov_base + iter.iov_offset;
+			vec.iov_len = min(iter_iov(&iter)->iov_len - iter.iov_offset,
+					 iov_iter_count(&iter));
+		}
+#else
+		vec = iov_iter_iovec(&iter);
+#endif
+		/* iov_iter_advance also skips zero-length iovecs. */
+		iov_iter_advance(&iter, vec.iov_len);
+		rv = sgdma_request_add(req, vec.iov_base, vec.iov_len, &pos);
+		if (rv) {
+			sgdma_request_free(req);
+			return rv;
+		}
+	}
+	rv = sgdma_request_submit(req);
+	if (rv == -EIOCBQUEUED)
+		iov_iter_advance(io, count);
+	else if (rv > 0)
+		iov_iter_advance(io, rv);
+	return rv;
+}
+
 static ssize_t cdev_write_iter(struct kiocb *iocb, struct iov_iter *io)
 {
-#if defined(RHEL_RELEASE_CODE)
-        #if (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 4))
-            return cdev_aio_write(iocb, iter_iov(io), io->nr_segs, io->iov_offset);
-        #else
-            return cdev_aio_write(iocb, io->iov, io->nr_segs, io->iov_offset);
-        #endif
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-        return cdev_aio_write(iocb, iter_iov(io), io->nr_segs, io->iov_offset);
-#else
-	return cdev_aio_write(iocb, io->iov, io->nr_segs, io->iov_offset);
-#endif
+	return cdev_sgdma_iter(iocb, io, true);
 }
 
 static ssize_t cdev_read_iter(struct kiocb *iocb, struct iov_iter *io)
 {
-#if defined(RHEL_RELEASE_CODE)
-        #if (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(9, 4))
-            return cdev_aio_read(iocb, iter_iov(io), io->nr_segs, io->iov_offset);
-        #else
-            return cdev_aio_read(iocb, io->iov, io->nr_segs, io->iov_offset);
-        #endif
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-        return cdev_aio_read(iocb, iter_iov(io), io->nr_segs, io->iov_offset);
+	return cdev_sgdma_iter(iocb, io, false);
+}
 #else
-        return cdev_aio_read(iocb, io->iov, io->nr_segs, io->iov_offset);
-#endif
+static ssize_t cdev_aio_rw(struct kiocb *iocb, const struct iovec *io,
+		unsigned long count, loff_t pos, bool write)
+{
+	struct xdma_cdev *xcdev = iocb->ki_filp->private_data;
+	struct sgdma_request *req;
+	unsigned long i;
+	int rv = xcdev_check(__func__, xcdev, 1);
+
+	if (rv)
+		return rv;
+	if (write != (xcdev->engine->dir == DMA_TO_DEVICE))
+		return -EINVAL;
+	req = sgdma_request_alloc(iocb, count, write);
+	if (!req)
+		return -ENOMEM;
+	for (i = 0; i < count; i++) {
+		rv = sgdma_request_add(req, io[i].iov_base, io[i].iov_len, &pos);
+		if (rv) {
+			sgdma_request_free(req);
+			return rv;
+		}
+	}
+	return sgdma_request_submit(req);
+}
+
+static ssize_t cdev_aio_write(struct kiocb *iocb, const struct iovec *io,
+		unsigned long count, loff_t pos)
+{
+	return cdev_aio_rw(iocb, io, count, pos, true);
+}
+
+static ssize_t cdev_aio_read(struct kiocb *iocb, const struct iovec *io,
+		unsigned long count, loff_t pos)
+{
+	return cdev_aio_rw(iocb, io, count, pos, false);
 }
 #endif
-
 
 static int ioctl_do_perf_start(struct xdma_engine *engine, unsigned long arg)
 {
@@ -845,7 +806,6 @@ static long char_sgdma_ioctl(struct file *file, unsigned int cmd,
 		unsigned long arg)
 {
 	struct xdma_cdev *xcdev = (struct xdma_cdev *)file->private_data;
-	struct xdma_dev *xdev;
 	struct xdma_engine *engine;
 
 	int rv = 0;
@@ -854,7 +814,6 @@ static long char_sgdma_ioctl(struct file *file, unsigned int cmd,
 	if (rv < 0)
 		return rv;
 
-	xdev = xcdev->xdev;
 	engine = xcdev->engine;
 
 	switch (cmd) {
@@ -896,16 +855,19 @@ static int char_sgdma_open(struct inode *inode, struct file *file)
 	struct xdma_cdev *xcdev;
 	struct xdma_engine *engine;
 
-	char_open(inode, file);
+	int rv = char_open(inode, file);
+
+	if (rv)
+		return rv;
 
 	xcdev = (struct xdma_cdev *)file->private_data;
 	engine = xcdev->engine;
 
 	if (engine->streaming && engine->dir == DMA_FROM_DEVICE) {
-		if (engine->device_open == 1)
+		if (engine->device_open)
 			return -EBUSY;
-		engine->device_open = 1;
 
+		engine->device_open = 1;
 		engine->eop_flush = (file->f_flags & O_TRUNC) ? 1 : 0;
 	}
 

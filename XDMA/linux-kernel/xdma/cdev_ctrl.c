@@ -23,6 +23,7 @@
 #include <linux/ioctl.h>
 #include "version.h"
 #include "xdma_cdev.h"
+#include "xdma_safety.h"
 #include "cdev_ctrl.h"
 
 #if ACCESS_OK_2_ARGS
@@ -34,67 +35,58 @@
 /*
  * character device file operations for control bus (through control bridge)
  */
-static ssize_t char_ctrl_read(struct file *fp, char __user *buf, size_t count,
+static int ctrl_access_check(struct xdma_cdev *xcdev, loff_t pos, size_t count)
+{
+	int rv = xcdev_check(__func__, xcdev, 0);
+
+	if (rv)
+		return rv;
+	if (pos < 0 || (pos & 3) || count < sizeof(u32))
+		return -EINVAL;
+	if (xcdev->bar < 0 || xcdev->bar >= XDMA_BAR_NUM ||
+	    !xcdev->xdev->bar[xcdev->bar])
+		return -ENODEV;
+	if (!xdma_range_valid(xcdev->xdev->bar_len[xcdev->bar], pos, sizeof(u32)))
+		return -EINVAL;
+	return 0;
+}
+
+static ssize_t char_ctrl_read(struct file *file, char __user *buf, size_t count,
 		loff_t *pos)
 {
-	struct xdma_cdev *xcdev = (struct xdma_cdev *)fp->private_data;
-	struct xdma_dev *xdev;
-	void __iomem *reg;
-	u32 w;
+	struct xdma_cdev *xcdev = file->private_data;
+	u32 value;
 	int rv;
 
-	rv = xcdev_check(__func__, xcdev, 0);
-	if (rv < 0)
-		return rv;
-	xdev = xcdev->xdev;
-
-	/* only 32-bit aligned and 32-bit multiples */
-	if (*pos & 3)
-		return -EPROTO;
-	/* first address is BAR base plus file position offset */
-	reg = xdev->bar[xcdev->bar] + *pos;
-	//w = read_register(reg);
-	w = ioread32(reg);
-	dbg_sg("%s(@%p, count=%ld, pos=%d) value = 0x%08x\n",
-			__func__, reg, (long)count, (int)*pos, w);
-	rv = copy_to_user(buf, &w, 4);
+	if (!count)
+		return 0;
+	rv = ctrl_access_check(xcdev, *pos, count);
 	if (rv)
-		dbg_sg("Copy to userspace failed but continuing\n");
-
-	*pos += 4;
-	return 4;
+		return rv;
+	value = ioread32(xcdev->xdev->bar[xcdev->bar] + *pos);
+	if (copy_to_user(buf, &value, sizeof(value)))
+		return -EFAULT;
+	*pos += sizeof(value);
+	return sizeof(value);
 }
 
 static ssize_t char_ctrl_write(struct file *file, const char __user *buf,
-			size_t count, loff_t *pos)
+		size_t count, loff_t *pos)
 {
-	struct xdma_cdev *xcdev = (struct xdma_cdev *)file->private_data;
-	struct xdma_dev *xdev;
-	void __iomem *reg;
-	u32 w;
+	struct xdma_cdev *xcdev = file->private_data;
+	u32 value;
 	int rv;
 
-	rv = xcdev_check(__func__, xcdev, 0);
-	if (rv < 0)
-		return rv;
-	xdev = xcdev->xdev;
-
-	/* only 32-bit aligned and 32-bit multiples */
-	if (*pos & 3)
-		return -EPROTO;
-
-	/* first address is BAR base plus file position offset */
-	reg = xdev->bar[xcdev->bar] + *pos;
-	rv = copy_from_user(&w, buf, 4);
+	if (!count)
+		return 0;
+	rv = ctrl_access_check(xcdev, *pos, count);
 	if (rv)
-		pr_info("copy from user failed %d/4, but continuing.\n", rv);
-
-	dbg_sg("%s(0x%08x @%p, count=%ld, pos=%d)\n",
-			__func__, w, reg, (long)count, (int)*pos);
-	//write_register(w, reg);
-	iowrite32(w, reg);
-	*pos += 4;
-	return 4;
+		return rv;
+	if (copy_from_user(&value, buf, sizeof(value)))
+		return -EFAULT;
+	iowrite32(value, xcdev->xdev->bar[xcdev->bar] + *pos);
+	*pos += sizeof(value);
+	return sizeof(value);
 }
 
 static long version_ioctl(struct xdma_cdev *xcdev, void __user *arg)
@@ -194,36 +186,27 @@ int bridge_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	struct xdma_dev *xdev;
 	struct xdma_cdev *xcdev = (struct xdma_cdev *)file->private_data;
-	unsigned long off;
-	unsigned long phys;
-	unsigned long vsize;
-	unsigned long psize;
+	resource_size_t off, phys, length;
+	unsigned long vsize = vma->vm_end - vma->vm_start;
 	int rv;
 
 	rv = xcdev_check(__func__, xcdev, 0);
-	if (rv < 0)
+	if (rv)
 		return rv;
 	xdev = xcdev->xdev;
-
-	off = vma->vm_pgoff << PAGE_SHIFT;
-	/* BAR physical address */
+	if (xcdev->bar < 0 || xcdev->bar >= XDMA_BAR_NUM ||
+	    !xdev->bar[xcdev->bar] ||
+	    !(pci_resource_flags(xdev->pdev, xcdev->bar) & IORESOURCE_MEM))
+		return -ENODEV;
+	length = pci_resource_len(xdev->pdev, xcdev->bar);
+	if (vma->vm_pgoff > (length >> PAGE_SHIFT))
+		return -EINVAL;
+	off = (resource_size_t)vma->vm_pgoff << PAGE_SHIFT;
+	if (!xdma_range_valid(length, off, vsize))
+		return -EINVAL;
 	phys = pci_resource_start(xdev->pdev, xcdev->bar) + off;
-	vsize = vma->vm_end - vma->vm_start;
-	/* complete resource */
-	psize = pci_resource_end(xdev->pdev, xcdev->bar) -
-		pci_resource_start(xdev->pdev, xcdev->bar) + 1 - off;
-
-	dbg_sg("mmap(): xcdev = 0x%08lx\n", (unsigned long)xcdev);
-	dbg_sg("mmap(): cdev->bar = %d\n", xcdev->bar);
-	dbg_sg("mmap(): xdev = 0x%p\n", xdev);
-	dbg_sg("mmap(): pci_dev = 0x%08lx\n", (unsigned long)xdev->pdev);
-	dbg_sg("off = 0x%lx, vsize 0x%lu, psize 0x%lu.\n", off, vsize, psize);
-	dbg_sg("start = 0x%llx\n",
-		(unsigned long long)pci_resource_start(xdev->pdev,
-		xcdev->bar));
-	dbg_sg("phys = 0x%lx\n", phys);
-
-	if (vsize > psize)
+	if (phys < pci_resource_start(xdev->pdev, xcdev->bar) ||
+	    (phys & ~PAGE_MASK) || (phys >> PAGE_SHIFT) > ULONG_MAX)
 		return -EINVAL;
 	/*
 	 * pages must not be cached as this would result in cache line sized

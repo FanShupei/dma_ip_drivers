@@ -20,6 +20,7 @@
 #define pr_fmt(fmt)     KBUILD_MODNAME ":%s: " fmt, __func__
 
 #include "xdma_cdev.h"
+#include "xdma_safety.h"
 #include "cdev_xvc.h"
 
 #define COMPLETION_LOOP_MAX	100
@@ -122,7 +123,7 @@ static long xvc_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	/* anything not copied ? */
 	if (rv) {
 		pr_info("copy_from_user xvc_obj failed: %d.\n", rv);
-		goto cleanup;
+		return -EFAULT;
 	}
 
 	opcode = xvc_obj.opcode;
@@ -134,7 +135,14 @@ static long xvc_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 
 	total_bits = xvc_obj.length;
-	total_bytes = (total_bits + 7) >> 3;
+	total_bytes = xdma_xvc_bytes(total_bits);
+	if (!total_bytes)
+		return -EINVAL;
+	if (xcdev->bar < 0 || xcdev->bar >= XDMA_BAR_NUM ||
+	    !xdev->bar[xcdev->bar] ||
+	    !xdma_range_valid(xdev->bar_len[xcdev->bar], xcdev->base,
+			XVC_BAR_CTRL_REG + sizeof(u32)))
+		return -EINVAL;
 
 	buffer = kmalloc(total_bytes * 3, GFP_KERNEL);
 	if (!buffer) {
@@ -163,7 +171,7 @@ static long xvc_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 
 	/* exclusive access */
-	spin_lock(&xcdev->lock);
+	mutex_lock(&xcdev->xvc_lock);
 
 	iobase = xdev->bar[xcdev->bar] + xcdev->base;
 	/* set length register to 32 initially if more than one
@@ -195,6 +203,7 @@ static long xvc_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			break;
 
 		memcpy(tdo_buf + bytes, &tdo_store, shift_bytes);
+		cond_resched();
 	}
 
 	if (rv < 0)
@@ -208,20 +217,18 @@ static long xvc_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		tdi_buf = tmp;
 	}
 
-	rv = copy_to_user(xvc_obj.tdo_buf, (const void *)tdo_buf, total_bytes);
-	if (rv)
-		pr_info("copy back tdo_buf failed: %d/%u.\n", rv, total_bytes);
-
 unlock:
 #if HAS_MMIOWB
 	mmiowb();
 #endif
-	spin_unlock(&xcdev->lock);
+	mutex_unlock(&xcdev->xvc_lock);
+	if (!rv && copy_to_user(xvc_obj.tdo_buf, tdo_buf, total_bytes))
+		rv = -EFAULT;
 
 cleanup:
 	kfree(buffer);
 
-	return rv;
+	return rv > 0 ? -EFAULT : rv;
 }
 
 /*

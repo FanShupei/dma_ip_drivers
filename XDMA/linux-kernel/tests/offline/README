@@ -1,0 +1,40 @@
+XDMA hardware-free regression tests
+
+Run from XDMA/linux-kernel:
+    python3 tests/offline/run.py
+Build the module separately:
+    make -C xdma -j4 W=1
+
+The runner compiles the actual request/iterator and descriptor routines from
+cdev_sgdma.c and libxdma.c, unchanged, against fake page pinning, DMA, allocation,
+and workqueue services. Bounds tests include the production xdma_safety.h.
+AddressSanitizer (including leak detection) and UndefinedBehaviorSanitizer are
+enabled. No module is loaded and no device node is opened. LeakSanitizer requires
+an environment without ptrace-based sandboxing.
+
+Coverage includes synchronous vectored requests, exactly-once AIO completion,
+allocation and later-vector pinning/alignment failures, DMA failures and short
+transfers, nonzero endpoint addresses, fixed addressing, iterator offsets and
+empty vectors, UBUF, unsupported iterator/NOWAIT rejection, queued AIO during
+removal, descriptor exhaustion/wrap and requests spanning more than two chunks,
+merged-scatterlist unmapping, BAR range overflow, and XVC size boundaries.
+
+AIO now prepares and pins all vectors in the submitting task, then queues a
+worker that uses xdma_xfer_submit. Synchronous iterators return their result
+directly. DMA operations are serialized per engine by the existing descriptor
+mutex; queueing AIO remains supported, but simultaneous hardware descriptor
+chains from independent AIO requests are intentionally removed. The obsolete,
+unexported xdma_xfer_submit_nowait/xdma_xfer_completion routines and declarations
+are removed with their sole in-tree caller. The old cdev_async_io cache is gone.
+
+Open files pin device storage. Removal rejects new operations, wakes blocked
+event readers, drains I/O and workers, revokes tracked BAR mappings, synchronizes
+completion processing, then releases hardware. Event waitqueue storage remains
+alive until open files (including epoll-held references) are released.
+
+These tests do not simulate the PCIe/DMA engine, kernel page pinning, real
+interrupt timing, or hot-unplug races. Hardware validation is still required for
+DMA round trips, fragmented transfers larger than two descriptor chunks,
+concurrent AIO, timeout/error recovery, and removal with active file descriptors,
+event readers, epoll registrations, and mappings. Older kernel compatibility
+branches are not validated by the build against the installed kernel.

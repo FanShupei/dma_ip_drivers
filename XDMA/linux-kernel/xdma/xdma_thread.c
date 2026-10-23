@@ -48,14 +48,21 @@ static int xdma_thread_cmpl_status_pend(struct list_head *work_item)
 
 static int xdma_thread_cmpl_status_proc(struct list_head *work_item)
 {
-	struct xdma_engine *engine;
-	struct xdma_transfer * transfer;
+	struct xdma_engine *engine = list_entry(work_item, struct xdma_engine,
+					      cmplthp_list);
+	struct xdma_transfer *transfer;
+	unsigned long flags;
+	u32 threshold = 0;
 
-	engine = list_entry(work_item, struct xdma_engine, cmplthp_list);
-	transfer = list_entry(engine->transfer_list.next, struct xdma_transfer,
-			entry);
-	if (transfer)
-		engine_service_poll(engine, transfer->desc_cmpl_th);
+	spin_lock_irqsave(&engine->lock, flags);
+	if (!list_empty(&engine->transfer_list)) {
+		transfer = list_first_entry(&engine->transfer_list,
+					    struct xdma_transfer, entry);
+		threshold = transfer->desc_cmpl_th;
+	}
+	spin_unlock_irqrestore(&engine->lock, flags);
+	if (threshold)
+		engine_service_poll(engine, threshold);
 	return 0;
 }
 
@@ -107,10 +114,13 @@ static int xthread_main(void *data)
 		pr_debug_thread("%s interruptible\n", thp->name);
 
 		/* any work to do? */
+		mutex_lock(&thp->work_lock);
 		lock_thread(thp);
 		if (!xthread_work_pending(thp)) {
 			unlock_thread(thp);
+			mutex_unlock(&thp->work_lock);
 			xthread_reschedule(thp);
+			mutex_lock(&thp->work_lock);
 			lock_thread(thp);
 		}
 		thp->schedule = 0;
@@ -126,6 +136,7 @@ static int xthread_main(void *data)
 			}
 		}
 		unlock_thread(thp);
+		mutex_unlock(&thp->work_lock);
 		schedule();
 	}
 
@@ -158,6 +169,7 @@ int xdma_kthread_start(struct xdma_kthread *thp, char *name, int id)
 	thp->id = id;
 
 	spin_lock_init(&thp->lock);
+	mutex_init(&thp->work_lock);
 	INIT_LIST_HEAD(&thp->work_list);
 	init_waitqueue_head(&thp->waitq);
 
@@ -230,10 +242,12 @@ void xdma_thread_remove_work(struct xdma_engine *engine)
 #endif
 
 	if (cmpl_thread) {
+		mutex_lock(&cmpl_thread->work_lock);
 		lock_thread(cmpl_thread);
 		list_del(&engine->cmplthp_list);
 		cmpl_thread->work_cnt--;
 		unlock_thread(cmpl_thread);
+		mutex_unlock(&cmpl_thread->work_lock);
 	}
 }
 
@@ -261,11 +275,13 @@ void xdma_thread_add_work(struct xdma_engine *engine)
 	}
 
 	thp = cs_threads + idx;
+	mutex_lock(&thp->work_lock);
 	lock_thread(thp);
 	list_add_tail(&engine->cmplthp_list, &thp->work_list);
 	engine->intr_work_cpu = idx;
 	thp->work_cnt++;
 	unlock_thread(thp);
+	mutex_unlock(&thp->work_lock);
 
 	pr_info("%s 0x%p assigned to cmpl status thread %s,%u.\n",
 		engine->name, engine, thp->name, thp->work_cnt);
